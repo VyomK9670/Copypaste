@@ -1,0 +1,312 @@
+"""
+Pre-market / intraday order-book imbalance scanner (DhanHQ v2)
+================================================================
+Install dependency first:  pip install dhanhq
+
+WHAT THIS DOES
+--------------
+1. Subscribes to 20-level depth for a list of symbols (works for many symbols
+   at once, per Dhan's docs — up to 50 instruments per 20-depth connection).
+2. Computes a buy-side and sell-side imbalance score per symbol using:
+     - total quantity within X% of LTP (filters out far-away/noise orders)
+     - number of distinct orders backing that quantity (spread-out orders
+       are treated as more "real" than one giant single order, which is
+       more consistent with genuine demand vs a single spoofed block)
+3. Ranks all symbols by net imbalance score.
+4. Prints the current top candidate every refresh cycle.
+5. Leaves a clearly separated STUB for switching to 200-depth on your top
+   pick, and a separate STUB for order placement — both disabled by default.
+
+THIS IS A SCAFFOLD, NOT A FINISHED STRATEGY.
+- It does not backtest anything (Dhan doesn't provide historical depth).
+- It does not place real orders until you explicitly fill in and enable
+  the ORDER EXECUTION STUB at the bottom, after you've validated the
+  scoring logic in shadow mode (log-only) for a while.
+- Not financial advice — you are responsible for testing and risk control
+  before connecting this to a funded account.
+"""
+
+import csv
+import io
+import time
+import threading
+import urllib.request
+from collections import defaultdict
+
+from dhanhq import DhanContext, FullDepth, dhanhq
+
+# ------------------------------------------------------------------
+# CONFIG — fill these in
+# ------------------------------------------------------------------
+CLIENT_ID = "YOUR_CLIENT_ID"
+ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+
+# Official Dhan instrument master — this is the SOURCE OF TRUTH for
+# security IDs. Never hand-type/guess security IDs; always resolve them
+# from this file, since IDs are Dhan-internal and don't match NSE
+# trading symbols directly.
+SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+
+# Put your 200 liquid stocks here as NSE TRADING SYMBOLS (Nifty 200 /
+# your own watchlist). The script resolves these to Dhan security IDs
+# automatically — do not hand-type security IDs, they're easy to get
+# wrong and Dhan is the only authoritative source for them.
+WATCHLIST_TRADING_SYMBOLS = [
+    "HDFCBANK", "TCS", "RELIANCE", "INFY", "ICICIBANK", "SBIN",
+    "AXISBANK", "KOTAKBANK", "LT", "ITC", "HINDUNILVR", "BAJFINANCE",
+    "BHARTIARTL", "MARUTI", "TITAN", "SUNPHARMA", "ULTRACEMCO", "WIPRO",
+    "ASIANPAINT", "NESTLEIND",
+    # ... extend to your full 200-symbol list. Symbols must match exactly
+    # what's in Dhan's CSV.
+]
+
+
+def fetch_scrip_master():
+    """
+    Downloads Dhan's official instrument master CSV. Run once at startup
+    (cache it locally per day — Dhan refreshes this file once daily).
+    """
+    with urllib.request.urlopen(SCRIP_MASTER_URL) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+    return list(csv.DictReader(io.StringIO(raw)))
+
+
+def build_symbol_list_and_prev_close(dhan, trading_symbols):
+    """
+    Resolves trading symbols -> (exchange_code, security_id) pairs for the
+    FullDepth subscription, and fetches previous close via the Market
+    Quote API instead of hand-typing it.
+
+    NOTE: column names below (SEM_EXM_EXCH_ID, SEM_SEGMENT,
+    SEM_TRADING_SYMBOL, SEM_SMST_SECURITY_ID) are per Dhan's published
+    scrip-master schema — verify against your actual downloaded CSV
+    header once, since minor naming can shift between versions.
+    """
+    rows = fetch_scrip_master()
+
+    symbol_to_secid = {}
+    for row in rows:
+        if (row.get("SEM_EXM_EXCH_ID") == "NSE"
+                and row.get("SEM_SEGMENT") == "E"
+                and row.get("SEM_TRADING_SYMBOL") in trading_symbols):
+            symbol_to_secid[row["SEM_TRADING_SYMBOL"]] = row["SEM_SMST_SECURITY_ID"]
+
+    missing = set(trading_symbols) - set(symbol_to_secid.keys())
+    if missing:
+        print(f"WARNING: {len(missing)} symbols not resolved — check "
+              f"spelling or CSV column names: {sorted(missing)}")
+
+    symbols_list = [(1, secid) for secid in symbol_to_secid.values()]
+
+    prev_close = {}
+    try:
+        quote_request = {"NSE_EQ": [int(s) for s in symbol_to_secid.values()]}
+        quote_resp = dhan.quote_data(quote_request)
+        data = quote_resp.get("data", {}).get("data", {}).get("NSE_EQ", {})
+        for secid, qdata in data.items():
+            prev_close[secid] = (qdata.get("net_change", {}).get("prev_close")
+                                  or qdata.get("ohlc", {}).get("close"))
+    except Exception as e:
+        print(f"Could not fetch previous close via API ({e}). Check the "
+              f"exact quote_data() response shape for your installed SDK "
+              f"version and adjust the parsing above.")
+
+    return symbols_list, prev_close
+
+PRICE_BAND_PCT = 1.0   # ignore orders whose price is more than this % from LTP
+NEAR_CLOSE_BAND_PCT = 0.5  # "near previous close" band used for prioritisation
+REFRESH_SECONDS = 2
+
+# ------------------------------------------------------------------
+# STATE
+# ------------------------------------------------------------------
+scores_lock = threading.Lock()
+scores = defaultdict(lambda: {"buy_score": 0.0, "sell_score": 0.0, "ltp": None})
+
+# Populated at runtime by build_symbol_list_and_prev_close() — do NOT
+# hand-type values here, they must come from the live API/CSV.
+PREV_CLOSE = {}
+
+
+def within_band(order_price, ltp, band_pct):
+    if ltp is None or ltp == 0:
+        return False
+    return abs(order_price - ltp) / ltp * 100.0 <= band_pct
+
+
+def compute_scores(security_id, ltp, bid_levels, ask_levels):
+    """
+    bid_levels / ask_levels: list of dicts like
+        {"price": float, "quantity": int, "orders": int}
+    This mirrors the structure Dhan sends for 20/200 depth packets —
+    adapt the field names once you've parsed the actual binary payload
+    per the docs (dhanhq.co/docs/v2/full-market-depth/).
+    """
+    buy_score = 0.0
+    sell_score = 0.0
+
+    for lvl in bid_levels:
+        if within_band(lvl["price"], ltp, PRICE_BAND_PCT):
+            # weight: quantity, boosted if the order sits near previous close
+            weight = 1.0
+            prev_close = PREV_CLOSE.get(security_id)
+            if prev_close and within_band(lvl["price"], prev_close, NEAR_CLOSE_BAND_PCT):
+                weight = 1.5
+            # spread across more distinct orders = slightly more "real"
+            spread_factor = min(lvl.get("orders", 1), 10) / 10.0
+            buy_score += lvl["quantity"] * weight * (0.7 + 0.3 * spread_factor)
+
+    for lvl in ask_levels:
+        if within_band(lvl["price"], ltp, PRICE_BAND_PCT):
+            weight = 1.0
+            prev_close = PREV_CLOSE.get(security_id)
+            if prev_close and within_band(lvl["price"], prev_close, NEAR_CLOSE_BAND_PCT):
+                weight = 1.5
+            spread_factor = min(lvl.get("orders", 1), 10) / 10.0
+            sell_score += lvl["quantity"] * weight * (0.7 + 0.3 * spread_factor)
+
+    with scores_lock:
+        scores[security_id]["buy_score"] = buy_score
+        scores[security_id]["sell_score"] = sell_score
+        scores[security_id]["ltp"] = ltp
+
+
+def handle_depth_packet(security_id, packet):
+    """
+    STUB: parse the raw packet from response.get_data() into bid_levels /
+    ask_levels / ltp, then call compute_scores(). The exact parsing depends
+    on the binary structure documented at:
+    https://dhanhq.co/docs/v2/full-market-depth/
+    (12-byte header, then repeated 16-byte bid packets, then 16-byte ask
+    packets). Fill this in once you've confirmed the SDK's decoded output
+    shape in your environment — some SDK versions decode this for you into
+    a dict already, others give raw bytes.
+    """
+    ltp = packet.get("LTP")
+    bid_levels = packet.get("bids", [])
+    ask_levels = packet.get("asks", [])
+    if ltp is not None:
+        compute_scores(security_id, ltp, bid_levels, ask_levels)
+
+
+def print_leaderboard():
+    with scores_lock:
+        ranked = sorted(
+            scores.items(),
+            key=lambda kv: (kv[1]["buy_score"] - kv[1]["sell_score"]),
+            reverse=True,
+        )
+    print("\n--- Imbalance Leaderboard ---")
+    for sid, s in ranked[:10]:
+        net = s["buy_score"] - s["sell_score"]
+        direction = "BUY-heavy" if net > 0 else "SELL-heavy" if net < 0 else "flat"
+        print(f"{sid:>10} | LTP={s['ltp']} | buy={s['buy_score']:.0f} "
+              f"sell={s['sell_score']:.0f} | net={net:.0f} ({direction})")
+
+
+def chunked(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+
+def run_scanner():
+    global PREV_CLOSE
+
+    dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+    dhan = dhanhq(dhan_context)
+
+    print("Resolving symbols from Dhan scrip master...")
+    symbols, PREV_CLOSE = build_symbol_list_and_prev_close(
+        dhan, WATCHLIST_TRADING_SYMBOLS
+    )
+    print(f"Resolved {len(symbols)} symbols. Previous close fetched for "
+          f"{len(PREV_CLOSE)} of them.")
+
+    # 20-depth allows up to 50 instruments per connection, and Dhan allows
+    # at most 5 concurrent websockets per account — so for a 200-symbol
+    # watchlist you'd need up to 4 connections running in parallel threads.
+    # This scaffold runs just the FIRST batch of up to 50 for simplicity;
+    # extend with threading.Thread per batch to cover the full 200.
+    if not symbols:
+        print("No symbols resolved — check WATCHLIST_TRADING_SYMBOLS and "
+              "the scrip master column names before running live.")
+        return
+
+    batch = symbols[:50]
+    depth_level = 20  # scan mode: 20-depth across many symbols
+    response = FullDepth(dhan_context, batch, depth_level)
+    response.run_forever()
+
+    last_print = 0
+    while True:
+        data = response.get_data()
+        if data:
+            # TODO: replace with actual field names once you confirm the
+            # decoded packet shape from your SDK version.
+            security_id = data.get("security_id")
+            if security_id:
+                handle_depth_packet(security_id, data)
+
+        if response.on_close:
+            print("Server disconnection detected. Reconnect logic goes here.")
+            break
+
+        now = time.time()
+        if now - last_print > REFRESH_SECONDS:
+            print_leaderboard()
+            last_print = now
+
+
+# ------------------------------------------------------------------
+# 200-DEPTH CONFIRMATION STUB (top pick only — 1 instrument per connection)
+# ------------------------------------------------------------------
+def confirm_top_pick_with_200depth(security_id):
+    """
+    Call this once your scanner has identified a top candidate.
+    Opens a SEPARATE websocket dedicated to that single symbol at 200-depth
+    for a deeper confirmation read before entry. Remember: Dhan allows only
+    1 instrument per 200-depth connection, and max 5 total websockets per
+    account — so run this only after narrowing down, not for all symbols.
+    """
+    dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+    instruments = [(1, security_id)]
+    depth_level = 200
+    response = FullDepth(dhan_context, instruments, depth_level)
+    response.run_forever()
+    # TODO: same parsing + scoring logic as above, just deeper book.
+    return response
+
+
+# ------------------------------------------------------------------
+# ORDER EXECUTION STUB — DISABLED BY DEFAULT
+# ------------------------------------------------------------------
+ENABLE_LIVE_ORDERS = False  # flip to True only after you've validated scoring
+
+def place_entry_order(dhan, security_id, quantity, side):
+    """
+    side: "BUY" or "SELL"
+    This is intentionally left unexecuted unless ENABLE_LIVE_ORDERS is True.
+    Fill in your actual risk checks (funds available, max position size,
+    circuit-limit exclusion, etc.) before ever setting this to True.
+    """
+    if not ENABLE_LIVE_ORDERS:
+        print(f"[SHADOW MODE] Would place {side} order: {security_id} x{quantity}")
+        return None
+
+    # from dhanhq import dhanhq
+    # order = dhan.place_order(
+    #     security_id=security_id,
+    #     exchange_segment=dhan.NSE,
+    #     transaction_type=dhan.BUY if side == "BUY" else dhan.SELL,
+    #     quantity=quantity,
+    #     order_type=dhan.MARKET,
+    #     product_type=dhan.INTRA,
+    #     price=0,
+    # )
+    # return order
+    raise NotImplementedError("Fill in real order logic and risk checks first.")
+
+
+if __name__ == "__main__":
+    run_scanner()
+
