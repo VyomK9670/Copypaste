@@ -77,24 +77,73 @@ def build_symbol_list_and_prev_close(dhan, trading_symbols):
     FullDepth subscription, and fetches previous close via the Market
     Quote API instead of hand-typing it.
 
-    NOTE: column names below (SEM_EXM_EXCH_ID, SEM_SEGMENT,
-    SEM_TRADING_SYMBOL, SEM_SMST_SECURITY_ID) are per Dhan's published
-    scrip-master schema — verify against your actual downloaded CSV
-    header once, since minor naming can shift between versions.
+    NOTE: column names below are per Dhan's published scrip-master schema
+    but are matched with whitespace/case normalization since CSV exports
+    can carry stray spaces or casing differences that cause silent 0-match
+    failures.
     """
     rows = fetch_scrip_master()
+    print(f"Scrip master downloaded: {len(rows)} total rows.")
 
+    if not rows:
+        print("ERROR: 0 rows downloaded — the CSV fetch itself failed or "
+              "returned empty content. Check network access to "
+              "images.dhan.co and print raw response length to confirm.")
+        return [], {}
+
+    # Show the ACTUAL column headers so we can confirm they match what the
+    # code expects, instead of assuming.
+    actual_columns = list(rows[0].keys())
+    print(f"Actual CSV columns found: {actual_columns}")
+
+    def norm(s):
+        return (s or "").strip().upper()
+
+    # Try to locate the right columns even if exact names differ slightly
+    # (e.g. extra spaces, different casing, alternate naming across CSV
+    # versions) rather than hard-failing on an exact string match.
+    def find_col(candidates):
+        for c in candidates:
+            if c in actual_columns:
+                return c
+        # fallback: case-insensitive partial match
+        for col in actual_columns:
+            for c in candidates:
+                if c.upper() in col.upper():
+                    return col
+        return None
+
+    exch_col = find_col(["SEM_EXM_EXCH_ID"])
+    seg_col = find_col(["SEM_SEGMENT"])
+    tsym_col = find_col(["SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL"])
+    secid_col = find_col(["SEM_SMST_SECURITY_ID"])
+
+    print(f"Resolved column mapping -> exchange: {exch_col}, "
+          f"segment: {seg_col}, trading_symbol: {tsym_col}, "
+          f"security_id: {secid_col}")
+
+    if not all([exch_col, seg_col, tsym_col, secid_col]):
+        print("ERROR: could not locate one or more required columns. "
+              "Copy the 'Actual CSV columns found' list above and adjust "
+              "find_col() candidates to match exactly.")
+        return [], {}
+
+    wanted = {norm(s) for s in trading_symbols}
     symbol_to_secid = {}
     for row in rows:
-        if (row.get("SEM_EXM_EXCH_ID") == "NSE"
-                and row.get("SEM_SEGMENT") == "E"
-                and row.get("SEM_TRADING_SYMBOL") in trading_symbols):
-            symbol_to_secid[row["SEM_TRADING_SYMBOL"]] = row["SEM_SMST_SECURITY_ID"]
+        if (norm(row.get(exch_col)) == "NSE"
+                and norm(row.get(seg_col)) == "E"
+                and norm(row.get(tsym_col)) in wanted):
+            symbol_to_secid[row[tsym_col].strip()] = row[secid_col].strip()
 
-    missing = set(trading_symbols) - set(symbol_to_secid.keys())
+    missing = wanted - {norm(s) for s in symbol_to_secid.keys()}
     if missing:
-        print(f"WARNING: {len(missing)} symbols not resolved — check "
-              f"spelling or CSV column names: {sorted(missing)}")
+        print(f"WARNING: {len(missing)} symbols not resolved: {sorted(missing)}")
+        # Show a small sample of what IS in the NSE/E segment so you can
+        # visually compare against your watchlist spelling.
+        sample = [row[tsym_col] for row in rows
+                  if norm(row.get(exch_col)) == "NSE" and norm(row.get(seg_col)) == "E"][:15]
+        print(f"Sample of valid NSE equity trading symbols in the file: {sample}")
 
     symbols_list = [(1, secid) for secid in symbol_to_secid.values()]
 
@@ -309,4 +358,3 @@ def place_entry_order(dhan, security_id, quantity, side):
 
 if __name__ == "__main__":
     run_scanner()
-
