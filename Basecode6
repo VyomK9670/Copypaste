@@ -1,0 +1,348 @@
+"""
+FULL LOGIC -- 3 stocks only, no CSV
+=====================================
+Builds on verify_3stocks.py once you confirmed the feed connects and
+packets flow. This adds:
+    1. Previous close fetched via Dhan's Quote API (NOT the CSV)
+    2. Price-band filtering (ignore orders far from LTP)
+    3. Near-previous-close weighting
+    4. Buy-side / sell-side imbalance scoring
+    5. A live leaderboard printed every REFRESH_SECONDS
+
+IMPORTANT -- READ BEFORE RUNNING
+---------------------------------
+This script's packet-parsing function (`parse_packet`) is written
+DEFENSIVELY because we have not yet confirmed the exact key names your
+installed dhanhq SDK version returns from response.get_data(). It tries
+several common key-name variants and prints a warning with the RAW
+packet if none match, so you'll immediately see what needs fixing
+instead of the script silently doing nothing (which is what happened
+with the CSV column names last time).
+
+If you already saw the raw packets from verify_3stocks.py, paste that
+output back and the parsing below can be locked to the exact real
+field names instead of guessing across variants.
+"""
+
+import time
+import threading
+from collections import defaultdict
+
+from dhanhq import DhanContext, FullDepth, dhanhq
+
+# ------------------------------------------------------------------
+CLIENT_ID = "YOUR_CLIENT_ID"
+ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+
+SYMBOLS = [
+    (1, "21401"),
+    (1, "21428"),
+    (1, "1333"),
+]
+
+PRICE_BAND_PCT = 1.0        # ignore orders whose price is >1% from LTP
+NEAR_CLOSE_BAND_PCT = 0.5   # "near previous close" band for extra weight
+REFRESH_SECONDS = 2
+DEBUG = False   # set True temporarily if you need to see raw packets / setup logs again
+# ------------------------------------------------------------------
+
+scores_lock = threading.Lock()
+scores = defaultdict(lambda: {"buy_score": 0.0, "sell_score": 0.0, "ltp": None,
+                               "best_buy_price": None, "best_sell_price": None,
+                               "cvd": 0})
+PREV_CLOSE = {}   # security_id (str) -> previous close (float), filled at startup
+_unparsed_warned = set()
+
+
+def fetch_prev_close(dhan, security_ids):
+    """
+    Uses Dhan's Quote API (not the CSV) to fetch previous close for the
+    3 security IDs. NOTE: response shape below is per Dhan's documented
+    quote_data() output; if your SDK version differs, this will print
+    the raw response so you can adjust the parsing.
+    """
+    prev_close = {}
+    try:
+        quote_request = {"NSE_EQ": [int(s) for s in security_ids]}
+        quote_resp = dhan.quote_data(quote_request)
+        if DEBUG:
+            print("Raw quote_data() response (for verification):")
+            print(quote_resp)
+            print()
+
+        data = quote_resp.get("data", {}).get("data", {}).get("NSE_EQ", {})
+        for secid, qdata in data.items():
+            pc = None
+            if isinstance(qdata, dict):
+                pc = (qdata.get("net_change", {}).get("prev_close")
+                      if isinstance(qdata.get("net_change"), dict) else None)
+                if pc is None:
+                    pc = qdata.get("ohlc", {}).get("close") if isinstance(qdata.get("ohlc"), dict) else None
+            if pc is not None:
+                prev_close[str(secid)] = float(pc)
+
+        if not prev_close and DEBUG:
+            print("WARNING: could not extract previous close from the "
+                  "response above. Check the printed raw response shape "
+                  "and adjust fetch_prev_close() to match the real keys.")
+    except Exception as e:
+        if DEBUG:
+            print(f"Could not fetch previous close via API ({e}). "
+                  f"Near-previous-close weighting will be skipped until this "
+                  f"is fixed.")
+
+    return prev_close
+
+
+def within_band(order_price, reference_price, band_pct):
+    if reference_price is None or reference_price == 0:
+        return False
+    return abs(order_price - reference_price) / reference_price * 100.0 <= band_pct
+
+
+def compute_scores(security_id, ltp, bid_levels, ask_levels):
+    """
+    bid_levels / ask_levels: list of dicts, each expected to have at
+    minimum 'price' and 'quantity' (and ideally 'orders' -- number of
+    distinct orders at that level). Missing 'orders' defaults to 1.
+
+    Also tracks, per side, the PRICE LEVEL with the single highest
+    pressure (qty x weight x spread_factor) -- this is your "best buying
+    price" / "best selling price" per the ranking logic requested.
+    """
+    buy_score = 0.0
+    sell_score = 0.0
+    best_buy_price = None
+    best_buy_pressure = -1.0
+    best_sell_price = None
+    best_sell_pressure = -1.0
+    prev_close = PREV_CLOSE.get(str(security_id))
+
+    for lvl in bid_levels:
+        price = lvl.get("price")
+        qty = lvl.get("quantity", 0)
+        if price is None or not within_band(price, ltp, PRICE_BAND_PCT):
+            continue
+        weight = 1.5 if (prev_close and within_band(price, prev_close, NEAR_CLOSE_BAND_PCT)) else 1.0
+        spread_factor = min(lvl.get("orders", 1), 10) / 10.0
+        pressure = qty * weight * (0.7 + 0.3 * spread_factor)
+        buy_score += pressure
+        if pressure > best_buy_pressure:
+            best_buy_pressure = pressure
+            best_buy_price = price
+
+    for lvl in ask_levels:
+        price = lvl.get("price")
+        qty = lvl.get("quantity", 0)
+        if price is None or not within_band(price, ltp, PRICE_BAND_PCT):
+            continue
+        weight = 1.5 if (prev_close and within_band(price, prev_close, NEAR_CLOSE_BAND_PCT)) else 1.0
+        spread_factor = min(lvl.get("orders", 1), 10) / 10.0
+        pressure = qty * weight * (0.7 + 0.3 * spread_factor)
+        sell_score += pressure
+        if pressure > best_sell_pressure:
+            best_sell_pressure = pressure
+            best_sell_price = price
+
+    with scores_lock:
+        scores[str(security_id)]["buy_score"] = buy_score
+        scores[str(security_id)]["sell_score"] = sell_score
+        scores[str(security_id)]["ltp"] = ltp
+        scores[str(security_id)]["best_buy_price"] = best_buy_price
+        scores[str(security_id)]["best_sell_price"] = best_sell_price
+
+
+def parse_packet(data):
+    """
+    DEFENSIVE parser: tries several common key-name variants since the
+    exact shape from your SDK version hasn't been locked in yet. Returns
+    (security_id, ltp, bid_levels, ask_levels, ltq, cum_volume).
+
+    ltq = last traded quantity for THIS tick, if the packet exposes it
+          directly (Dhan's trade/full packets often do).
+    cum_volume = cumulative traded volume for the day, if that's what's
+          exposed instead -- used as a fallback to derive per-tick
+          volume by diffing against the previous value.
+
+    If nothing recognizable is found, prints the raw packet ONCE per
+    distinct shape so the real keys can be confirmed.
+    """
+    if not isinstance(data, dict):
+        return None, None, None, None, None, None
+
+    security_id = (data.get("security_id") or data.get("securityId")
+                    or data.get("SecurityId") or data.get("security_Id"))
+    ltp = (data.get("LTP") or data.get("ltp") or data.get("last_traded_price"))
+
+    bid_levels = (data.get("bids") or data.get("bid_depth")
+                  or data.get("buy") or data.get("bidLevels"))
+    ask_levels = (data.get("asks") or data.get("ask_depth")
+                  or data.get("sell") or data.get("askLevels"))
+
+    ltq = (data.get("LTQ") or data.get("ltq") or data.get("last_traded_qty")
+           or data.get("lastTradedQuantity"))
+    cum_volume = (data.get("volume") or data.get("Volume")
+                  or data.get("total_traded_qty") or data.get("volTraded"))
+
+    if security_id is None or ltp is None or bid_levels is None or ask_levels is None:
+        shape_key = tuple(sorted(data.keys()))
+        if shape_key not in _unparsed_warned:
+            _unparsed_warned.add(shape_key)
+            if DEBUG:
+                print("UNRECOGNIZED PACKET SHAPE -- please share this so parsing can be fixed:")
+                print(data)
+                print()
+        return None, None, None, None, None, None
+
+    def normalize(levels):
+        out = []
+        for lvl in levels:
+            if isinstance(lvl, dict):
+                price = lvl.get("price") or lvl.get("Price")
+                qty = lvl.get("quantity") or lvl.get("Quantity") or lvl.get("qty")
+                orders = lvl.get("orders") or lvl.get("Orders") or lvl.get("numOrders") or 1
+                if price is not None and qty is not None:
+                    out.append({"price": float(price), "quantity": int(qty), "orders": int(orders)})
+        return out
+
+    return (security_id, float(ltp), normalize(bid_levels), normalize(ask_levels),
+            (int(ltq) if ltq is not None else None),
+            (int(cum_volume) if cum_volume is not None else None))
+
+
+def classify_and_update_cvd(security_id, ltp, bid_levels, ask_levels, ltq, cum_volume):
+    """
+    Trade-based classification:
+      - trade at/near best ASK  -> buyer-initiated (aggressive buying)
+      - trade at/near best BID  -> seller-initiated (aggressive selling)
+      - otherwise (between bid/ask, e.g. mid-price print) -> classified
+        by whichever side it's numerically closer to.
+
+    CVD = cumulative(buy-initiated volume) - cumulative(sell-initiated volume)
+
+    Per-tick volume is taken directly from LTQ if the packet provides it;
+    otherwise derived by diffing cumulative volume against the last seen
+    value for this security.
+    """
+    sid = str(security_id)
+    best_bid = bid_levels[0]["price"] if bid_levels else None
+    best_ask = ask_levels[0]["price"] if ask_levels else None
+
+    # figure out this tick's traded quantity
+    tick_qty = None
+    if ltq is not None:
+        tick_qty = ltq
+    elif cum_volume is not None:
+        prev_cum = _last_cum_volume.get(sid)
+        _last_cum_volume[sid] = cum_volume
+        if prev_cum is not None and cum_volume >= prev_cum:
+            tick_qty = cum_volume - prev_cum
+
+    if not tick_qty:
+        return  # nothing to classify this tick
+
+    # classify
+    if best_ask is not None and ltp >= best_ask:
+        direction = "buy"
+    elif best_bid is not None and ltp <= best_bid:
+        direction = "sell"
+    elif best_bid is not None and best_ask is not None:
+        # between bid/ask (e.g. a mid-price print) -- assign to nearer side
+        direction = "buy" if abs(ltp - best_ask) <= abs(ltp - best_bid) else "sell"
+    else:
+        return  # no bid/ask reference available, skip classification
+
+    with scores_lock:
+        if direction == "buy":
+            scores[sid]["cvd"] = scores[sid].get("cvd", 0) + tick_qty
+        else:
+            scores[sid]["cvd"] = scores[sid].get("cvd", 0) - tick_qty
+
+
+_last_cum_volume = {}
+
+
+def print_leaderboard():
+    with scores_lock:
+        ranked = sorted(
+            scores.items(),
+            key=lambda kv: abs(kv[1]["buy_score"] - kv[1]["sell_score"]),
+            reverse=True,
+        )
+
+    # Clear screen and reset cursor to top-left so the table updates
+    # in place instead of scrolling with a new block every refresh.
+    print("\033[H\033[J", end="")
+
+    col = "{:<5}{:<12}{:<9}{:<14}{:<12}{:<14}{:<12}{:<12}{:<12}{:<10}"
+    print(col.format("Rank", "SecurityID", "LTP", "BestBuyPx", "BuyScore",
+                      "BestSellPx", "SellScore", "Net", "CVD", "Verdict"))
+    print("-" * 110)
+
+    for rank, (sid, s) in enumerate(ranked, start=1):
+        net = s["buy_score"] - s["sell_score"]
+        if net > 0:
+            verdict = "BUY>SELL"
+        elif net < 0:
+            verdict = "SELL>BUY"
+        else:
+            verdict = "EQUAL"
+
+        ltp_disp = f"{s['ltp']:.2f}" if s["ltp"] is not None else "-"
+        bbp_disp = f"{s['best_buy_price']:.2f}" if s["best_buy_price"] is not None else "-"
+        bsp_disp = f"{s['best_sell_price']:.2f}" if s["best_sell_price"] is not None else "-"
+
+        print(col.format(
+            rank, sid, ltp_disp, bbp_disp, f"{s['buy_score']:.0f}",
+            bsp_disp, f"{s['sell_score']:.0f}", f"{net:.0f}",
+            f"{s.get('cvd', 0)}", verdict
+        ))
+
+
+def main():
+    dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+    dhan = dhanhq(dhan_context)
+
+    if DEBUG:
+        print("Fetching previous close for 3 symbols via Quote API...")
+    global PREV_CLOSE
+    PREV_CLOSE = fetch_prev_close(dhan, [sid for _, sid in SYMBOLS])
+    if DEBUG:
+        print(f"Previous close fetched for {len(PREV_CLOSE)} of {len(SYMBOLS)} symbols.\n")
+        print("Connecting to Dhan FullDepth (20-level) for 3 symbols...")
+
+    depth_level = 20
+    response = FullDepth(dhan_context, SYMBOLS, depth_level)
+    response.run_forever()
+
+    if DEBUG:
+        print("Connected. Streaming... (Ctrl+C to stop)\n")
+
+    last_print = 0
+    try:
+        while True:
+            data = response.get_data()
+            if data:
+                security_id, ltp, bid_levels, ask_levels, ltq, cum_volume = parse_packet(data)
+                if security_id is not None:
+                    compute_scores(security_id, ltp, bid_levels, ask_levels)
+                    classify_and_update_cvd(security_id, ltp, bid_levels, ask_levels, ltq, cum_volume)
+
+            if response.on_close:
+                if DEBUG:
+                    print("Server disconnection detected.")
+                break
+
+            now = time.time()
+            if now - last_print > REFRESH_SECONDS:
+                print_leaderboard()
+                last_print = now
+
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+
