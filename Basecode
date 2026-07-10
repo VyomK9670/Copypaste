@@ -1,0 +1,99 @@
+"""
+MINIMAL VERIFICATION SCRIPT — 3 stocks only
+=============================================
+Purpose: confirm your Dhan credentials + FullDepth connection + basic
+data flow actually work end-to-end, before scaling to 200 symbols or
+touching the scrip-master CSV at all.
+
+Install first:  pip install dhanhq
+
+Fill in CLIENT_ID / ACCESS_TOKEN below, then run:
+    python verify_3stocks.py
+
+WHAT TO EXPECT
+--------------
+- Connects once, subscribes to 3 known security IDs at 20-depth.
+- Prints RAW packets first (so you can see the actual shape/keys Dhan
+  sends back on your installed SDK version) — this is the important
+  part, since guessing field names is exactly what broke the last
+  version. Compare this raw output against what any scoring code expects
+  before writing more logic on top of it.
+- After a few raw prints, switches to a simple heartbeat so you can
+  confirm the feed keeps flowing without flooding your console.
+- No CSV download, no order placement, no previous-close lookups — pure
+  connectivity + data-shape check.
+"""
+
+import time
+from dhanhq import DhanContext, FullDepth
+
+# ------------------------------------------------------------------
+CLIENT_ID = "YOUR_CLIENT_ID"
+ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
+
+# (exchange_code, security_id) — 1 = NSE_EQ per Dhan SDK convention.
+SYMBOLS = [
+    (1, "21401"),
+    (1, "21428"),
+    (1, "1333"),
+]
+
+RAW_PRINT_LIMIT = 10   # how many raw packets to dump before switching to heartbeat mode
+# ------------------------------------------------------------------
+
+
+def main():
+    print("Connecting to Dhan FullDepth (20-level) for 3 symbols...")
+    dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+    depth_level = 20
+
+    try:
+        response = FullDepth(dhan_context, SYMBOLS, depth_level)
+        response.run_forever()
+    except Exception as e:
+        print(f"CONNECTION FAILED: {e}")
+        print("Check: is your ACCESS_TOKEN valid/not expired? Is your "
+              "Dhan account enabled for Data APIs? Is the market open or "
+              "in pre-open right now (feed may be quiet outside trading "
+              "hours)?")
+        return
+
+    print("Connected. Waiting for packets... (Ctrl+C to stop)\n")
+
+    raw_count = 0
+
+    try:
+        while True:
+            data = response.get_data()
+
+            if data:
+                raw_count += 1
+
+                if raw_count <= RAW_PRINT_LIMIT:
+                    # THIS is the important output — look at the actual
+                    # keys/structure here (security_id, LTP, bids, asks,
+                    # or whatever names your installed SDK version uses)
+                    # before building scoring logic on top of it.
+                    print(f"--- RAW PACKET #{raw_count} ---")
+                    print(data)
+                    print()
+                elif raw_count % 20 == 0:
+                    print(f"...received {raw_count} packets so far (feed is alive)")
+
+            if response.on_close:
+                print("Server disconnection detected.")
+                break
+
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print(f"\nStopped by user. Total packets received: {raw_count}")
+        if raw_count == 0:
+            print("NO PACKETS RECEIVED — check: market hours, whether "
+                  "these 3 security IDs are valid/tradeable, and that "
+                  "your Data API subscription is active on your account.")
+
+
+if __name__ == "__main__":
+    main()
+
